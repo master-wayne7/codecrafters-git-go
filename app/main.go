@@ -346,11 +346,11 @@ func commitTree(treeSha string, parentSha string, message string) {
 	var payload bytes.Buffer
 
 	// tree line
-	payload.WriteString("tree" + treeSha + "\n")
+	payload.WriteString("tree " + treeSha + "\n")
 
 	// optional parent line
 	if parentSha != "" {
-		payload.WriteString("parent" + parentSha + "\n")
+		payload.WriteString("parent " + parentSha + "\n")
 	}
 
 	// author / committer (hardcoded name/email allowed)
