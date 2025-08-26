@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"time"
 )
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
@@ -61,6 +62,15 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(sha)
+	case "commit-tree":
+		if len(os.Args) < 7 {
+			fmt.Fprintf(os.Stderr, "usage: mygit commit-tree <tree_sha> -p <parent_sha> -m <message> \n")
+			os.Exit(1)
+		}
+		treeSha := os.Args[2]
+		parentSha := os.Args[4]
+		message := os.Args[6]
+		commitTree(treeSha, parentSha, message)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
@@ -330,4 +340,46 @@ func writeTree(dir string) (string, error) {
 		return "", err
 	}
 	return treeHex, nil
+}
+
+func commitTree(treeSha string, parentSha string, message string) {
+	var payload bytes.Buffer
+
+	// tree line
+	payload.WriteString("tree" + treeSha + "\n")
+
+	// optional parent line
+	if parentSha != "" {
+		payload.WriteString("parent" + parentSha + "\n")
+	}
+
+	// author / committer (hardcoded name/email allowed)
+	now := time.Now()
+	ts := now.Unix()
+	_, offset := now.Zone()
+	sign := '+'
+	if offset < 0 {
+		sign = '-'
+		offset = -offset
+	}
+	h := offset / 3600
+	m := (offset % 3600) / 60
+	tz := fmt.Sprintf("%c%02d%02d", sign, h, m)
+
+	author := "Ronit Rameja <ronitrameja28@gmail.com>"
+	payload.WriteString(fmt.Sprintf("author %s %d %s\n", author, ts, tz))
+	payload.WriteString(fmt.Sprintf("committer %s %d %s\n", author, ts, tz))
+
+	// blank line then commit message
+	payload.WriteByte('\n')
+	payload.WriteString(message)
+	payload.WriteByte('\n')
+
+	// write commit object
+	commitHex, _, err := writeObject("commit", payload.Bytes())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing commit object: %s\n", err)
+		return
+	}
+	fmt.Println(commitHex)
 }
