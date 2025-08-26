@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 )
 
@@ -53,6 +54,13 @@ func main() {
 		} else {
 			lsTree(os.Args[2], false)
 		}
+	case "write-tree":
+		sha, err := writeTree(".")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing tree: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(sha)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
@@ -96,6 +104,47 @@ func readObject(hash string) ([]byte, error) {
 	return nil, errors.New("file empty")
 }
 
+// writeObject writes an object of type objType ("blob" or "tree") with the provided
+// content (already the raw content for the object, e.g. blob bytes or tree payload).
+// It returns the 40-char hex SHA, the raw 20-byte SHA, or an error.
+func writeObject(objType string, content []byte) (string, [20]byte, error) {
+	header := objType + " " + strconv.Itoa(len(content)) + "\x00"
+
+	hasher := sha1.New()
+	_, _ = hasher.Write([]byte(header))
+	_, _ = hasher.Write(content)
+	sum := hasher.Sum(nil)
+
+	var raw [20]byte
+	copy(raw[:], sum)
+	hexStr := hex.EncodeToString(sum)
+
+	var buf bytes.Buffer
+	w := zlib.NewWriter(&buf)
+	if _, err := w.Write([]byte(header)); err != nil {
+		return "", raw, err
+	}
+	if _, err := w.Write(content); err != nil {
+		return "", raw, err
+	}
+	if err := w.Close(); err != nil {
+		return "", raw, err
+	}
+	objectsDir := filepath.Join(".git", "objects", hexStr[:2])
+	if err := os.MkdirAll(objectsDir, 0755); err != nil {
+		return "", raw, err
+	}
+
+	// fixed: write the file under the remaining hex chars (not the prefix again)
+	objectPath := filepath.Join(objectsDir, hexStr[2:])
+	if _, err := os.Stat(objectPath); os.IsNotExist(err) {
+		if err := os.WriteFile(objectPath, buf.Bytes(), 0644); err != nil {
+			return "", raw, err
+		}
+	}
+	return hexStr, raw, nil
+}
+
 // cat-file command
 func catFile(hash string) {
 
@@ -125,33 +174,10 @@ func hashObject(file string, write bool) {
 	sha1HashBytes := hasher.Sum(nil)
 	sha1HexString := hex.EncodeToString(sha1HashBytes)
 
-	// write compressed object only when -w was passed
+	// write compressed object only when -w was passed, reuse writeObject
 	if write {
-		var b bytes.Buffer
-		w := zlib.NewWriter(&b)
-
-		if _, err := w.Write([]byte(header)); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing header to zlib writer: %s\n", err)
-			return
-		}
-		if _, err := w.Write(data); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing content to zlib writer: %s\n", err)
-			return
-		}
-		if err := w.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error closing zlib writer: %s\n", err)
-			return
-		}
-
-		objectsDir := ".git/objects/" + sha1HexString[:2]
-		if err := os.MkdirAll(objectsDir, 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
-			return
-		}
-
-		objectPath := filepath.Join(objectsDir, sha1HexString[2:])
-		if err := os.WriteFile(objectPath, b.Bytes(), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing object file: %s\n", err)
+		if _, _, err := writeObject("blob", data); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing blob object: %s\n", err)
 			return
 		}
 	}
@@ -215,4 +241,93 @@ func lsTree(hash string, nameOnly bool) {
 			fmt.Printf("%s %s %s\t%s\n", modeOut, objType, shaHex, name)
 		}
 	}
+}
+
+// writeTree builds a tree object for the directory 'dir' (recursively),
+// writes any needed blob/tree objects to .git/objects and returns the
+// 40-char hex SHA of the created tree.
+func writeTree(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+
+	var names []string
+	for _, e := range entries {
+		if e.Name() == ".git" {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+
+	var payload bytes.Buffer
+
+	for _, name := range names {
+		full := filepath.Join(dir, name)
+		info, err := os.Lstat(full)
+		if err != nil {
+			return "", err
+		}
+
+		var mode string
+		var shaRaw [20]byte
+
+		if info.IsDir() {
+			// create subtree and get its hex SHA
+			subHex, err := writeTree(full)
+			if err != nil {
+				return "", err
+			}
+			shaBytes, err := hex.DecodeString(subHex)
+			if err != nil {
+				return "", err
+			}
+			copy(shaRaw[:], shaBytes)
+			mode = "40000"
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(full)
+			if err != nil {
+				return "", err
+			}
+			_, raw, err := writeObject("blob", []byte(linkTarget))
+			if err != nil {
+				return "", err
+			}
+			shaRaw = raw
+			mode = "120000"
+		} else {
+			// regular file -> create blob object
+			data, err := os.ReadFile(full)
+			if err != nil {
+				return "", err
+			}
+			_, raw, err := writeObject("blob", data)
+			if err != nil {
+				return "", err
+			}
+			shaRaw = raw
+
+			// determine file mode (executable or not)
+			if info.Mode()&0111 != 0 {
+				mode = "100755"
+			} else {
+				mode = "100644"
+			}
+		}
+
+		// append entry: "<mode> <name>\x00<20_byte_sha>"
+		payload.WriteString(mode)
+		payload.WriteByte(' ')
+		payload.WriteString(name)
+		payload.WriteByte(0)
+		payload.Write(shaRaw[:])
+	}
+
+	// write tree object using writeObject helper
+	treeHex, _, err := writeObject("tree", payload.Bytes())
+	if err != nil {
+		return "", err
+	}
+	return treeHex, nil
 }
