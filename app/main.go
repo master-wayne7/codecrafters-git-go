@@ -78,15 +78,20 @@ func hashObject() {
 		return
 	}
 
+	// create header that must be included in the SHA computation
+	header := "blob " + strconv.Itoa(len(data)) + "\x00"
+
+	// compute SHA over header + data (before compression)
 	hasher := sha1.New()
+	hasher.Write([]byte(header))
 	hasher.Write(data)
 	sha1HashBytes := hasher.Sum(nil)
 	sha1HexString := hex.EncodeToString(sha1HashBytes)
 
+	// compress the same header + data and write to object file
 	var b bytes.Buffer
 	w := zlib.NewWriter(&b)
 
-	header := "blob " + strconv.Itoa(len(data)) + "\x00"
 	if _, err := w.Write([]byte(header)); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing header to zlib writer: %s\n", err)
 		return
@@ -115,5 +120,4 @@ func hashObject() {
 	}
 
 	fmt.Println(sha1HexString)
-
 }
