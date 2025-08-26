@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 )
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
@@ -94,7 +93,7 @@ func readObject(hash string) ([]byte, error) {
 	if i := bytes.IndexByte(outBytes, '\x00'); i != -1 {
 		return outBytes[i+1:], nil
 	}
-	return nil, errors.New("File empty")
+	return nil, errors.New("file empty")
 }
 
 // cat-file command
