@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -19,41 +23,97 @@ func main() {
 
 	switch command := os.Args[1]; command {
 	case "init":
-		for _, dir := range []string{".git", ".git/objects", ".git/refs"} {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
-			}
-		}
-
-		headFileContents := []byte("ref: refs/heads/main\n")
-		if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing file: %s\n", err)
-		}
-
-		fmt.Println("Initialized git directory")
+		initFunction()
 	case "cat-file":
-		hash := os.Args[3]
-		data, err := os.ReadFile(".git/objects/" + hash[:2] + "/" + hash[2:])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading file: %s\n", err)
-			return
-		}
-		r, err := zlib.NewReader(bytes.NewReader(data))
-		if err != nil {
-			fmt.Printf("Error: %s", err.Error())
-			return
-		}
-		var out bytes.Buffer
-		io.Copy(&out, r)
-		content := out.String()
-		if i := strings.IndexByte(content, '\x00'); i != -1 {
-			content = content[i+1:]
-		}
-		fmt.Print(content)
-		r.Close()
-
+		catFile()
+	case "hash-object":
+		hashObject()
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
 	}
+}
+
+func initFunction() {
+	for _, dir := range []string{".git", ".git/objects", ".git/refs"} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
+		}
+	}
+
+	headFileContents := []byte("ref: refs/heads/main\n")
+	if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing file: %s\n", err)
+	}
+
+	fmt.Println("Initialized git directory")
+}
+func catFile() {
+	hash := os.Args[3]
+	data, err := os.ReadFile(".git/objects/" + hash[:2] + "/" + hash[2:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading file: %s\n", err)
+		return
+	}
+	r, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		fmt.Printf("Error: %s", err.Error())
+		return
+	}
+	var out bytes.Buffer
+	io.Copy(&out, r)
+	content := out.String()
+	if i := strings.IndexByte(content, '\x00'); i != -1 {
+		content = content[i+1:]
+	}
+	fmt.Print(content)
+	r.Close()
+}
+
+func hashObject() {
+	file := os.Args[3]
+	data, err := os.ReadFile(file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading file: %s\n", err)
+		return
+	}
+
+	hasher := sha1.New()
+	hasher.Write(data)
+	sha1HashBytes := hasher.Sum(nil)
+	sha1HexString := hex.EncodeToString(sha1HashBytes)
+
+	var b bytes.Buffer
+	w := zlib.NewWriter(&b)
+
+	header := "blob " + strconv.Itoa(len(data)) + "\x00"
+	if _, err := w.Write([]byte(header)); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing header to zlib writer: %s\n", err)
+		return
+	}
+	if _, err := w.Write(data); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing content to zlib writer: %s\n", err)
+		return
+	}
+
+	// Close to flush compressed data into the buffer
+	if err := w.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error closing zlib writer: %s\n", err)
+		return
+	}
+
+	objectsDir := ".git/objects/" + sha1HexString[:2]
+	if err := os.MkdirAll(objectsDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
+		return
+	}
+
+	objectPath := filepath.Join(objectsDir, sha1HexString[2:])
+	if err := os.WriteFile(objectPath, b.Bytes(), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing object file: %s\n", err)
+		return
+	}
+
+	fmt.Println(sha1HexString)
+
 }
