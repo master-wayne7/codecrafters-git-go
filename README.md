@@ -54,10 +54,7 @@ codecrafters-git-go/
 │   │   └── git_http.go       # HTTP communication, refs discovery
 │   └── clone/                # Clone orchestration
 │       └── clone.go          # High-level clone workflow
-├── go.mod                    # Go module definition
-├── app/
-│   └── main.go              # Original monolithic version (preserved)
-└── README_MODULAR.md        # This documentation
+└── go.mod                    # Go module definition
 ```
 
 ## Module Overview
