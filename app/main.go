@@ -708,14 +708,27 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 		return fmt.Errorf("unsupported pack version %d", version)
 	}
 	count := binary.BigEndian.Uint32(pack[8:12])
+
+	// First pass: parse all object headers and store raw data
+	type rawObject struct {
+		offset      int64
+		objType     int
+		size        int
+		data        []byte
+		baseSha     string
+		baseOffset  int64
+		isProcessed bool
+	}
+
+	rawObjects := make([]rawObject, count)
 	offset := 12
 
-	objects := make([]objEntry, 0, count)
 	for i := uint32(0); i < count; i++ {
 		if offset >= len(pack) {
 			return errors.New("unexpected end of pack")
 		}
-		objectStart := int64(offset) // track starting offset for this object
+		objectStart := int64(offset)
+
 		// parse object header (type + size) variable length
 		first := pack[offset]
 		offset++
@@ -728,15 +741,12 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 			size |= int(first&0x7f) << shift
 			shift += 7
 		}
-		// handle delta headers
+
 		var baseSha string
 		var baseOffset int64
+
 		switch objType {
 		case 6: // ofs-delta
-			// offset is encoded as variable-length big-endian base offset
-			// see git pack format: a variable-length offset where MSB set indicates continuation
-			// compute base offset backward from current offset
-			n := 0
 			c := pack[offset]
 			offset++
 			baseOffset = int64(c & 0x7f)
@@ -745,10 +755,8 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 				offset++
 				baseOffset = (baseOffset + 1) << 7
 				baseOffset |= int64(c & 0x7f)
-				n++
 			}
 		case 7: // ref-delta
-			// next 20 bytes are base object's sha1
 			if offset+20 > len(pack) {
 				return errors.New("pack truncated in ref-delta")
 			}
@@ -756,13 +764,12 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 			offset += 20
 		}
 
-		// now compressed data: create a reader over pack[offset:]
+		// read compressed data
 		inner := bytes.NewReader(pack[offset:])
 		zr, err := zlib.NewReader(inner)
 		if err != nil {
 			return fmt.Errorf("zlib new reader failed: %w", err)
 		}
-		// read decompressed bytes (size may be target size for non-delta; for delta it's delta size)
 		var decompressed bytes.Buffer
 		if _, err := io.Copy(&decompressed, zr); err != nil {
 			zr.Close()
@@ -774,75 +781,133 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 		consumed := int(inner.Size()) - inner.Len()
 		offset += consumed
 
-		var content []byte
-		var finalType int
-		if objType == 6 || objType == 7 {
-			// delta: find base content
-			var base []byte
-			var baseType int
-			if objType == 7 {
-				// ref-delta: baseSha variable
-				if b, t, ok := findObjectByShaWithType(objects, baseSha); ok {
-					base = b
-					baseType = t
+		rawObjects[i] = rawObject{
+			offset:     objectStart,
+			objType:    objType,
+			size:       size,
+			data:       decompressed.Bytes(),
+			baseSha:    baseSha,
+			baseOffset: baseOffset,
+		}
+	}
+
+	// Second pass: resolve objects (process non-deltas first, then deltas)
+	processedObjects := make([]objEntry, 0, count)
+
+	for attempts := 0; attempts < int(count)+1; attempts++ {
+		progressMade := false
+
+		for i := range rawObjects {
+			if rawObjects[i].isProcessed {
+				continue
+			}
+
+			raw := &rawObjects[i]
+			var content []byte
+			var finalType int
+
+			if raw.objType == 6 || raw.objType == 7 {
+				// Delta object - need base
+				var base []byte
+				var baseType int
+				found := false
+
+				if raw.objType == 7 {
+					// ref-delta
+					for _, processed := range processedObjects {
+						if processed.sha == raw.baseSha {
+							base = processed.data
+							baseType = processed.typ
+							found = true
+							break
+						}
+					}
+					if !found {
+						// try read from existing git objects
+						if b2, err := readObjectFromGitDir(gitDir, raw.baseSha); err == nil {
+							base = b2
+							baseType = 3 // assume blob ### CHANGE THIS ###
+							found = true
+						}
+					}
 				} else {
-					// try read from existing git objects in gitDir
-					if b2, err := readObjectFromGitDir(gitDir, baseSha); err == nil {
-						base = b2
-						baseType = 3 // assume blob if we can't determine type ### CHANGE THIS ###
-					} else {
-						return fmt.Errorf("base object %s not found for ref-delta", baseSha)
+					// ofs-delta
+					targetOffset := raw.offset - raw.baseOffset
+					for _, processed := range processedObjects {
+						if processed.offset == targetOffset {
+							base = processed.data
+							baseType = processed.typ
+							found = true
+							break
+						}
 					}
 				}
+
+				if !found {
+					continue // try again in next iteration
+				}
+
+				// apply delta
+				reconstructed, err := applyGitDelta(base, raw.data)
+				if err != nil {
+					return fmt.Errorf("delta apply failed: %w", err)
+				}
+				content = reconstructed
+				finalType = baseType
 			} else {
-				// ofs-delta: find base object by offset
-				// baseOffset is relative to current position, we need to find the object at that position
-				targetOffset := int64(offset) - baseOffset - int64(consumed)
-				if b, t, ok := findObjectByOffset(objects, targetOffset); ok {
-					base = b
-					baseType = t
-				} else {
-					return fmt.Errorf("ofs-delta base at offset %d not found", targetOffset)
+				// non-delta
+				content = raw.data
+				finalType = raw.objType
+			}
+
+			// map type to string
+			var typeStr string
+			switch finalType {
+			case 1:
+				typeStr = "commit"
+			case 2:
+				typeStr = "tree"
+			case 3:
+				typeStr = "blob"
+			case 4:
+				typeStr = "tag"
+			default:
+				typeStr = "blob"
+			}
+
+			// write object
+			shaHex, _, err := writeObjectIntoGitDir(typeStr, content, gitDir)
+			if err != nil {
+				return err
+			}
+
+			processedObjects = append(processedObjects, objEntry{
+				typ:    finalType,
+				data:   content,
+				sha:    shaHex,
+				offset: raw.offset,
+			})
+
+			raw.isProcessed = true
+			progressMade = true
+		}
+
+		if !progressMade {
+			// Check if all objects are processed
+			allProcessed := true
+			for i := range rawObjects {
+				if !rawObjects[i].isProcessed {
+					allProcessed = false
+					break
 				}
 			}
-			// apply delta
-			delta := decompressed.Bytes()
-			reconstructed, err := applyGitDelta(base, delta)
-			if err != nil {
-				return fmt.Errorf("delta apply failed: %w", err)
+			if allProcessed {
+				break
 			}
-			content = reconstructed
-			finalType = baseType // preserve base object type
-		} else {
-			// non-delta: decompressed bytes are the full object payload (header-less).
-			content = decompressed.Bytes()
-			finalType = objType
+			return errors.New("unable to resolve all delta objects - circular dependency or missing base")
 		}
-
-		// map pack object type to object string for writeObject
-		var typeStr string
-		switch finalType {
-		case 1:
-			typeStr = "commit"
-		case 2:
-			typeStr = "tree"
-		case 3:
-			typeStr = "blob"
-		case 4:
-			typeStr = "tag"
-		default:
-			// fallback to blob
-			typeStr = "blob"
-		}
-
-		// write using writeObject helper but into the repository's .git path: temporarily change CWD to gitDir's parent when writing files
-		// use writeObject which writes into ".git/objects"; temporarily set GIT_DIR env? simpler: pass content to a helper that writes directly into gitDir
-		shaHex, _, err := writeObjectIntoGitDir(typeStr, content, gitDir)
-		if err != nil {
-			return err
-		}
-		objects = append(objects, objEntry{typ: finalType, data: content, sha: shaHex, offset: objectStart})
 	}
+
 	return nil
 }
 
