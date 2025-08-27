@@ -467,7 +467,7 @@ func clone(repoUrl string, dir string) error {
 	if err := os.WriteFile(filepath.Join(gitDir, "refs", "heads", filepath.Base(branchRef)), []byte(branchSha+"\n"), 0644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: ref/heads/"+filepath.Base(branchRef)+"\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/"+filepath.Base(branchRef)+"\n"), 0644); err != nil {
 		return err
 	}
 
@@ -481,7 +481,7 @@ func clone(repoUrl string, dir string) error {
 
 // fetchInfoRefs GET /info/refs?service=git-upload-pack and returns map ref->sha (hex)
 func fetchInfoRefs(base string) (map[string]string, error) {
-	u := strings.TrimSuffix(base, "/") + "info/refs?service=git-upload-pack"
+	u := strings.TrimSuffix(base, "/") + "/info/refs?service=git-upload-pack"
 	resp, err := http.Get(u)
 	if err != nil {
 		return nil, err
