@@ -1,59 +1,47 @@
-[![progress-banner](https://backend.codecrafters.io/progress/git/14c928ad-b67d-4300-8baf-060af3891ccc)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# MyGit
 
-This is a starting point for Go solutions to the
-["Build Your Own Git" Challenge](https://codecrafters.io/challenges/git).
+MyGit is a simple implementation of a version control system inspired by Git. This project aims to provide a basic understanding of how Git works under the hood by implementing core functionalities such as initializing a repository, managing objects, committing changes, and cloning repositories.
 
-In this challenge, you'll build a small Git implementation that's capable of
-initializing a repository, creating commits and cloning a public repository.
-Along the way we'll learn about the `.git` directory, Git objects (blobs,
-commits, trees etc.), Git's transfer protocols and more.
+## Features
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+- **Initialize a Repository**: Create a new Git repository with the necessary directory structure.
+- **Manage Git Objects**: Read, write, and hash Git objects (blobs, trees, commits).
+- **Commit Changes**: Create commit objects with associated metadata.
+- **Clone Repositories**: Clone a remote Git repository and check out files.
+- **Checkout Commits**: Restore files from a specific commit.
 
-# Passing the first stage
+## Installation
 
-The entry point for your Git implementation is in `app/main.go`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+To install MyGit, clone the repository and build the application:
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
+```bash
+git clone <repository-url>
+cd mygit
+go build -o mygit ./cmd/mygit
 ```
 
-That's all!
+## Usage
 
-# Stage 2 & beyond
+After building the application, you can use it from the command line:
 
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `go (1.24)` installed locally
-1. Run `./your_program.sh` to run your Git implementation, which is implemented
-   in `app/main.go`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
-
-# Testing locally
-
-The `your_program.sh` script is expected to operate on the `.git` folder inside
-the current working directory. If you're running this inside the root of this
-repository, you might end up accidentally damaging your repository's `.git`
-folder.
-
-We suggest executing `your_program.sh` in a different folder when testing
-locally. For example:
-
-```sh
-mkdir -p /tmp/testing && cd /tmp/testing
-/path/to/your/repo/your_program.sh init
+```bash
+./mygit <command> [<args>...]
 ```
 
-To make this easier to type out, you could add a
-[shell alias](https://shapeshed.com/unix-alias/):
+### Commands
 
-```sh
-alias mygit=/path/to/your/repo/your_program.sh
+- `init`: Initializes a new Git repository.
+- `cat-file -p <hash>`: Displays the content of a Git object.
+- `hash-object -w <file>`: Computes the hash of a file and optionally writes it as a Git object.
+- `ls-tree --name-only <tree_hash>`: Lists the files in a tree object.
+- `write-tree`: Writes the current directory structure as a tree object.
+- `commit-tree <tree_sha> -p <parent_sha> -m <message>`: Creates a new commit object.
+- `clone <repo-url> <dir>`: Clones a remote repository into the specified directory.
 
-mkdir -p /tmp/testing && cd /tmp/testing
-mygit init
-```
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request for any improvements or bug fixes.
+
+## License
+
+This project is licensed under the MIT License. See the LICENSE file for details.

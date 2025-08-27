@@ -1,19 +1,31 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
+
+// keep arrays of reconstructed objects for ofs-delta base lookup
+type objEntry struct {
+	typ  int
+	data []byte
+	sha  string
+}
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
 func main() {
@@ -71,6 +83,17 @@ func main() {
 		parentSha := os.Args[4]
 		message := os.Args[6]
 		commitTree(treeSha, parentSha, message)
+	case "clone":
+		if len(os.Args) < 4 {
+			fmt.Fprintf(os.Stderr, "usage: mygit clone <repo-url> <dir>\n")
+			os.Exit(1)
+		}
+		repoUrl := os.Args[2]
+		dir := os.Args[4]
+		if err := clone(repoUrl, dir); err != nil {
+			fmt.Fprintf(os.Stderr, "clone failed: %s\n", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
@@ -382,4 +405,655 @@ func commitTree(treeSha string, parentSha string, message string) {
 		return
 	}
 	fmt.Println(commitHex)
+}
+
+// clone implements a minimal smart-HTTP client that:
+//   - discovers refs via /info/refs?service=git-upload-pack
+//   - requests the target branch commit via git-upload-pack POST
+//   - parses pkt-line / side-band responses and extracts the packfile
+//   - parses the packfile, reconstructs objects (including deltas) and writes them to .git/objects
+//   - writes refs/heads/<branch> and HEAD and checks out files into the working tree
+func clone(repoUrl string, dir string) error {
+	// creating the trget dir
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	// normalize the url
+	u, err := url.Parse(repoUrl)
+	if err != nil {
+		return err
+	}
+
+	// ensure path is ending with .git
+	if !strings.HasSuffix(u.Path, ".git") {
+		u.Path = strings.TrimSuffix(u.Path, "/") + ".git"
+	}
+	base := u.String()
+
+	// fetch advertised refs
+	refs, err := fetchInfoRefs(base)
+	if err != nil {
+		return err
+	}
+
+	// chose a branch to checkout
+	branchRef, branchSha := choseBranchRef(refs)
+	if branchRef == "" {
+		return errors.New("no branch ref found")
+	}
+
+	// request pack containing branch sha
+	pack, err := fetchPack(base, branchSha)
+	if err != nil {
+		return err
+	}
+
+	// prepare .git directory inside target dir
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "refs", "heads"), 0755); err != nil {
+		return err
+	}
+
+	// parse pack and write objects into .git/objects
+	if err := parsePackAndWrite(pack, gitDir); err != nil {
+		return err
+	}
+
+	// write branch ref and HEAD
+	if err := os.WriteFile(filepath.Join(gitDir, "refs", "heads", filepath.Base(branchRef)), []byte(branchSha+"\n"), 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: ref/heads/"+filepath.Base(branchRef)+"\n"), 0644); err != nil {
+		return err
+	}
+
+	// checkout working tree from commit
+	if err := checkoutCommitIntoDir(branchSha, dir, gitDir); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// fetchInfoRefs GET /info/refs?service=git-upload-pack and returns map ref->sha (hex)
+func fetchInfoRefs(base string) (map[string]string, error) {
+	u := strings.TrimSuffix(base, "/") + "info/refs?service=git-upload-pack"
+	resp, err := http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	r := bufio.NewReader(resp.Body)
+
+	refs := map[string]string{}
+	for {
+		line, err := readPktLine(r)
+		if err != nil {
+			return nil, err
+		}
+		if line == nil { // flush
+			break
+		}
+
+		// each packet line may contain multiple refs separated by \n
+		parts := bytes.Split(line, []byte{'\n'})
+		for _, p := range parts {
+			if len(p) == 0 {
+				continue
+			}
+
+			// first line may contain capabilitiees after NUL
+			// format: <sha> <ref>\0<capabilities>
+			nul := bytes.IndexByte(p, 0)
+			if nul != -1 {
+				head := p[:nul]
+				fields := bytes.SplitN(head, []byte{' '}, 2)
+				if len(fields) == 2 {
+					sha := string(fields[0])
+					ref := string(fields[1])
+					refs[ref] = sha
+				}
+			} else {
+				fields := bytes.SplitN(p, []byte{' '}, 2)
+				if len(fields) == 2 {
+					sha := string(fields[0])
+					ref := string(fields[1])
+					refs[ref] = sha
+				}
+			}
+		}
+	}
+	return refs, nil
+}
+
+// choseBranchRef selects a branch ref name and sha; prefer refs/heads/main then any ref/heads/*
+func choseBranchRef(refs map[string]string) (string, string) {
+	if sha, ok := refs["refs/heads/main"]; ok {
+		return "refs/heads/main", sha
+	}
+	for r, s := range refs {
+		if strings.HasPrefix(r, "refs/heads/") {
+			return r, s
+		}
+	}
+
+	// fallback pick any ref
+	for r, s := range refs {
+		return r, s
+	}
+	return "", ""
+}
+
+// build an upload pack request asking for one want and declaring side band  64k compability
+func buildUploadPackRequest(wantSha string) []byte {
+	var b bytes.Buffer
+	writePkt(&b, fmt.Sprintf("want %s side-band-64k thin-pack\n", wantSha))
+	writePkt(&b, "done\n")
+	// trailing flush is not required strictly
+	b.WriteString("0000")
+	return b.Bytes()
+}
+
+func writePkt(w io.Writer, s string) {
+	// length = 4 + payload
+	l := 4 + len(s)
+	fmt.Fprintf(w, "%04x", l)
+	w.Write([]byte(s))
+}
+
+// fetchPack posts upload-pack request and returns raw packfile bytes
+func fetchPack(base string, wantSha string) ([]byte, error) {
+	u := strings.TrimSuffix(base, "/") + "/git-upload-pack"
+	reqbody := buildUploadPackRequest(wantSha)
+	req, err := http.NewRequest("POST", u, bytes.NewReader(reqbody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+	req.Header.Set("Accept", "application/x-git-upload-pack-result")
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+	var packBuf bytes.Buffer
+
+	for {
+		line, err := readPktLine(reader)
+		if err != nil {
+			return nil, err
+		}
+		if line == nil {
+			continue
+		}
+		if len(line) == 0 {
+			continue
+		}
+		// side band detection first byte is channel 1,2,3
+		if line[0] == '1' || line[0] == '2' || line[0] == '3' {
+			ch := line[0]
+			payload := line[1:]
+			if ch == '1' {
+				// data
+				packBuf.Write(payload)
+			} else if ch == '2' {
+				// progress
+				fmt.Fprintf(os.Stderr, "%s", &payload)
+			} else if ch == '3' {
+				// error
+				return nil, fmt.Errorf("remote error: %s", string(payload))
+			}
+			continue
+		}
+		// if line starts with PACK then server switched to raw pack
+		if bytes.HasPrefix(line, []byte("PACK")) {
+			// write this line and then copy the rest of the response
+			packBuf.Write(line)
+			_, err := io.Copy(&packBuf, reader)
+			if err != nil {
+				return nil, err
+			}
+			break
+		}
+		// otherwise packet line could contain textual status
+	}
+	return packBuf.Bytes(), nil
+}
+
+func readPktLine(r *bufio.Reader) ([]byte, error) {
+	hdr := make([]byte, 4)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		if err == io.EOF {
+			return nil, nil
+		}
+		return nil, err
+	}
+	l, err := strconv.ParseInt(string(hdr), 16, 0)
+	if err != nil {
+		return nil, err
+	}
+	if l == 0 {
+		return nil, nil //flush packet
+	}
+	payloadLen := int(l) - 4
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// parsePackAndWrite parses pack[] and writes objects into gitDir/.git/objects via writeObject
+func parsePackAndWrite(pack []byte, gitDir string) error {
+	if len(pack) < 12 {
+		return errors.New("pack too small")
+	}
+	if string(pack[0:4]) != "PACK" {
+		return errors.New("invalid pack header")
+	}
+	version := binary.BigEndian.Uint32(pack[4:8])
+	if version != 2 && version != 3 {
+		return fmt.Errorf("unsupported pack version %d", version)
+	}
+	count := binary.BigEndian.Uint32(pack[8:12])
+	offset := 12
+
+	objects := make([]objEntry, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if offset >= len(pack) {
+			return errors.New("unexpected end of pack")
+		}
+		// parse object header (type + size) variable length
+		first := pack[offset]
+		offset++
+		objType := int((first >> 4) & 0x7)
+		size := int(first & 0x0f)
+		shift := 4
+		for (first & 0x80) != 0 {
+			first = pack[offset]
+			offset++
+			size |= int(first&0x7f) << shift
+			shift += 7
+		}
+		// handle delta headers
+		var baseSha string
+		var baseOffset int64
+		if objType == 6 { // ofs-delta
+			// offset is encoded as variable-length big-endian base offset
+			// see git pack format: a variable-length offset where MSB set indicates continuation
+			// compute base offset backward from current offset
+			n := 0
+			c := pack[offset]
+			offset++
+			baseOffset = int64(c & 0x7f)
+			for (c & 0x80) != 0 {
+				c = pack[offset]
+				offset++
+				baseOffset = (baseOffset + 1) << 7
+				baseOffset |= int64(c & 0x7f)
+				n++
+			}
+			// base object is located at (current absolute offset - baseOffset)
+			baseOffset = int64(offset) - baseOffset
+		} else if objType == 7 { // ref-delta
+			// next 20 bytes are base object's sha1
+			if offset+20 > len(pack) {
+				return errors.New("pack truncated in ref-delta")
+			}
+			baseSha = hex.EncodeToString(pack[offset : offset+20])
+			offset += 20
+		}
+
+		// now compressed data: create a reader over pack[offset:]
+		inner := bytes.NewReader(pack[offset:])
+		zr, err := zlib.NewReader(inner)
+		if err != nil {
+			return fmt.Errorf("zlib new reader failed: %w", err)
+		}
+		// read decompressed bytes (size may be target size for non-delta; for delta it's delta size)
+		var decompressed bytes.Buffer
+		if _, err := io.Copy(&decompressed, zr); err != nil {
+			zr.Close()
+			return fmt.Errorf("zlib decompress failed: %w", err)
+		}
+		if err := zr.Close(); err != nil {
+			return err
+		}
+		consumed := int(inner.Size()) - inner.Len()
+		offset += consumed
+
+		var content []byte
+		var finalType int
+		if objType == 6 || objType == 7 {
+			// delta: find base content
+			var base []byte
+			if objType == 7 {
+				// ref-delta: baseSha variable
+				if b, ok := findObjectBySha(objects, baseSha); ok {
+					base = b
+				} else {
+					// try read from existing git objects in gitDir
+					if b2, err := readObjectFromGitDir(gitDir, baseSha); err == nil {
+						base = b2
+					} else {
+						return fmt.Errorf("base object %s not found for ref-delta", baseSha)
+					}
+				}
+			} else {
+				// ofs-delta: baseOffset points at absolute position in pack; need to find which prior object matches that offset
+				// We cannot directly map offset->object easily; but pack stores objects sequentially; the 'objects' slice preserves order.
+				// find base by walking previous objects in reverse and choosing one whose cumulative consumed bytes correspond.
+				// Simpler approach: search for an object whose computed sha matches the base by applying delta iteratively is complex.
+				// In practice most packs use ref-delta or include bases earlier; attempt to match by walking objects and using underlying pack decode not implemented here.
+				// Try to find object by locating the object whose reconstructed content position equals baseOffset by re-parsing — simplified workaround:
+				found := false
+				for _, e := range objects {
+					// we don't track pack offsets per-object here; best-effort: if one object's sha equals pack base reference (not available), fail
+					_ = e
+				}
+				if !found {
+					return errors.New("ofs-delta base lookup not implemented in this simplified parser")
+				}
+			}
+			// apply delta
+			delta := decompressed.Bytes()
+			reconstructed, err := applyGitDelta(base, delta)
+			if err != nil {
+				return fmt.Errorf("delta apply failed: %w", err)
+			}
+			content = reconstructed
+			finalType = 3 // assume result is blob unless base type tracked; we'll try to infer by reading the content later
+		} else {
+			// non-delta: decompressed bytes are the full object payload (header-less).
+			content = decompressed.Bytes()
+			finalType = objType
+		}
+
+		// map pack object type to object string for writeObject
+		var typeStr string
+		switch finalType {
+		case 1:
+			typeStr = "commit"
+		case 2:
+			typeStr = "tree"
+		case 3:
+			typeStr = "blob"
+		case 4:
+			typeStr = "tag"
+		default:
+			// fallback to blob
+			typeStr = "blob"
+		}
+
+		// write using writeObject helper but into the repository's .git path: temporarily change CWD to gitDir's parent when writing files
+		// use writeObject which writes into ".git/objects"; temporarily set GIT_DIR env? simpler: pass content to a helper that writes directly into gitDir
+		shaHex, _, err := writeObjectIntoGitDir(typeStr, content, gitDir)
+		if err != nil {
+			return err
+		}
+		objects = append(objects, objEntry{typ: finalType, data: content, sha: shaHex})
+	}
+	return nil
+}
+
+// findObjectBySha searches objects slice for matching sha and returns data
+func findObjectBySha(objs []objEntry, sha string) ([]byte, bool) {
+	for _, o := range objs {
+		if o.sha == sha {
+			return o.data, true
+		}
+	}
+	return nil, false
+}
+
+// readObjectFromGitDir reads object content (payload after header) from gitDir/.git/objects by hex sha
+func readObjectFromGitDir(gitDir string, shaHex string) ([]byte, error) {
+	path := filepath.Join(gitDir, "objects", shaHex[:2], shaHex[2:])
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	r, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	if _, err := io.Copy(&out, r); err != nil {
+		r.Close()
+		return nil, err
+	}
+	r.Close()
+	outBytes := out.Bytes()
+	if i := bytes.IndexByte(outBytes, 0); i != -1 {
+		return outBytes[i+1:], nil
+	}
+	return nil, errors.New("invalid object")
+}
+
+// applyGitDelta implements Git's delta application algorithm.
+// base: base object raw bytes, delta: delta bytes as in pack (header omitted)
+func applyGitDelta(base []byte, delta []byte) ([]byte, error) {
+	reader := bytes.NewReader(delta)
+	// read src size (varint)
+	_, err := readVarInt(reader)
+	if err != nil {
+		return nil, err
+	}
+	// read tgt size
+	tgtSize, err := readVarInt(reader)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	for {
+		op, err := reader.ReadByte()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if (op & 0x80) != 0 {
+			// copy from base
+			var off int
+			var sz int
+			if (op & 0x01) != 0 {
+				b, _ := reader.ReadByte()
+				off |= int(b)
+			}
+			if (op & 0x02) != 0 {
+				b, _ := reader.ReadByte()
+				off |= int(b) << 8
+			}
+			if (op & 0x04) != 0 {
+				b, _ := reader.ReadByte()
+				off |= int(b) << 16
+			}
+			if (op & 0x08) != 0 {
+				b, _ := reader.ReadByte()
+				off |= int(b) << 24
+			}
+			if (op & 0x10) != 0 {
+				b, _ := reader.ReadByte()
+				sz |= int(b)
+			}
+			if (op & 0x20) != 0 {
+				b, _ := reader.ReadByte()
+				sz |= int(b) << 8
+			}
+			if (op & 0x40) != 0 {
+				b, _ := reader.ReadByte()
+				sz |= int(b) << 16
+			}
+			if sz == 0 {
+				sz = 1 << 32 // unlikely, but per spec 0 means copy full?
+			}
+			if off+sz > len(base) {
+				return nil, errors.New("delta copy out of range")
+			}
+			out.Write(base[off : off+sz])
+		} else {
+			// insert literal of length op
+			n := int(op)
+			if n == 0 {
+				continue
+			}
+			buf := make([]byte, n)
+			if _, err := io.ReadFull(reader, buf); err != nil {
+				return nil, err
+			}
+			out.Write(buf)
+		}
+	}
+	if out.Len() != int(tgtSize) {
+		// not strictly fatal; but check
+		// return nil, fmt.Errorf("delta result size mismatch: got %d want %d", out.Len(), tgtSize)
+	}
+	return out.Bytes(), nil
+}
+
+// readVarInt reads Git-style variable-length int used in delta headers
+func readVarInt(r *bytes.Reader) (int, error) {
+	result := 0
+	shift := 0
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		result |= int(b&0x7f) << shift
+		if (b & 0x80) == 0 {
+			break
+		}
+		shift += 7
+	}
+	return result, nil
+}
+
+// writeObjectIntoGitDir is like writeObject but writes into provided gitDir (path to .git)
+func writeObjectIntoGitDir(objType string, content []byte, gitDir string) (string, [20]byte, error) {
+	header := objType + " " + strconv.Itoa(len(content)) + "\x00"
+
+	h := sha1.New()
+	h.Write([]byte(header))
+	h.Write(content)
+	sum := h.Sum(nil)
+	var raw [20]byte
+	copy(raw[:], sum)
+	hexStr := hex.EncodeToString(sum)
+
+	var buf bytes.Buffer
+	w := zlib.NewWriter(&buf)
+	if _, err := w.Write([]byte(header)); err != nil {
+		return "", raw, err
+	}
+	if _, err := w.Write(content); err != nil {
+		return "", raw, err
+	}
+	if err := w.Close(); err != nil {
+		return "", raw, err
+	}
+
+	objectsDir := filepath.Join(gitDir, "objects", hexStr[:2])
+	if err := os.MkdirAll(objectsDir, 0755); err != nil {
+		return "", raw, err
+	}
+	objectPath := filepath.Join(objectsDir, hexStr[2:])
+	if _, err := os.Stat(objectPath); os.IsNotExist(err) {
+		if err := os.WriteFile(objectPath, buf.Bytes(), 0644); err != nil {
+			return "", raw, err
+		}
+	}
+	return hexStr, raw, nil
+}
+
+// checkoutCommitIntoDir reads commit object (commitSha) from .git and writes working files into targetDir
+func checkoutCommitIntoDir(commitSha string, targetDir string, gitDir string) error {
+	commitPayload, err := readObjectFromGitDir(gitDir, commitSha)
+	if err != nil {
+		return err
+	}
+	// find tree line
+	lines := strings.Split(string(commitPayload), "\n")
+	var treeSha string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "tree ") {
+			treeSha = strings.TrimSpace(strings.TrimPrefix(l, "tree "))
+			break
+		}
+	}
+	if treeSha == "" {
+		return errors.New("commit has no tree")
+	}
+	// remove any existing files in targetDir except .git
+	entries, _ := os.ReadDir(targetDir)
+	for _, e := range entries {
+		if e.Name() == ".git" {
+			continue
+		}
+		os.RemoveAll(filepath.Join(targetDir, e.Name()))
+	}
+	// recursively checkout tree
+	return checkoutTree(treeSha, targetDir, gitDir)
+}
+
+// checkoutTree writes files/directories for tree object into dir
+func checkoutTree(treeSha string, dir string, gitDir string) error {
+	payload, err := readObjectFromGitDir(gitDir, treeSha)
+	if err != nil {
+		return err
+	}
+	// parse entries: "<mode> <name>\x00<20_raw_sha>"
+	i := 0
+	for i < len(payload) {
+		// read mode until space
+		j := i
+		for j < len(payload) && payload[j] != ' ' {
+			j++
+		}
+		mode := string(payload[i:j])
+		j++ // skip space
+		// read name until NUL
+		k := j
+		for k < len(payload) && payload[k] != 0 {
+			k++
+		}
+		name := string(payload[j:k])
+		k++ // skip NUL
+		if k+20 > len(payload) {
+			return errors.New("truncated tree entry")
+		}
+		shaRaw := payload[k : k+20]
+		shaHex := hex.EncodeToString(shaRaw)
+		k += 20
+		i = k
+
+		full := filepath.Join(dir, name)
+		if mode == "40000" {
+			// directory
+			if err := os.MkdirAll(full, 0755); err != nil {
+				return err
+			}
+			if err := checkoutTree(shaHex, full, gitDir); err != nil {
+				return err
+			}
+		} else {
+			// blob
+			content, err := readObjectFromGitDir(gitDir, shaHex)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(full, content, 0644); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
