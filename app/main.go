@@ -22,9 +22,10 @@ import (
 
 // keep arrays of reconstructed objects for ofs-delta base lookup
 type objEntry struct {
-	typ  int
-	data []byte
-	sha  string
+	typ    int
+	data   []byte
+	sha    string
+	offset int64 // track pack offset for ofs-delta lookup
 }
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
@@ -414,7 +415,7 @@ func commitTree(treeSha string, parentSha string, message string) {
 //   - parses the packfile, reconstructs objects (including deltas) and writes them to .git/objects
 //   - writes refs/heads/<branch> and HEAD and checks out files into the working tree
 func clone(repoUrl string, dir string) error {
-	// creating the trget dir
+	// creating the target dir
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -455,6 +456,9 @@ func clone(repoUrl string, dir string) error {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Join(gitDir, "refs", "heads"), 0755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "refs", "remotes", "origin"), 0755); err != nil {
 		return err
 	}
 
@@ -711,6 +715,7 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 		if offset >= len(pack) {
 			return errors.New("unexpected end of pack")
 		}
+		objectStart := int64(offset) // track starting offset for this object
 		// parse object header (type + size) variable length
 		first := pack[offset]
 		offset++
@@ -774,32 +779,30 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 		if objType == 6 || objType == 7 {
 			// delta: find base content
 			var base []byte
+			var baseType int
 			if objType == 7 {
 				// ref-delta: baseSha variable
-				if b, ok := findObjectBySha(objects, baseSha); ok {
+				if b, t, ok := findObjectByShaWithType(objects, baseSha); ok {
 					base = b
+					baseType = t
 				} else {
 					// try read from existing git objects in gitDir
 					if b2, err := readObjectFromGitDir(gitDir, baseSha); err == nil {
 						base = b2
+						baseType = 3 // assume blob if we can't determine type ### CHANGE THIS ###
 					} else {
 						return fmt.Errorf("base object %s not found for ref-delta", baseSha)
 					}
 				}
 			} else {
-				// ofs-delta: baseOffset points at absolute position in pack; need to find which prior object matches that offset
-				// We cannot directly map offset->object easily; but pack stores objects sequentially; the 'objects' slice preserves order.
-				// find base by walking previous objects in reverse and choosing one whose cumulative consumed bytes correspond.
-				// Simpler approach: search for an object whose computed sha matches the base by applying delta iteratively is complex.
-				// In practice most packs use ref-delta or include bases earlier; attempt to match by walking objects and using underlying pack decode not implemented here.
-				// Try to find object by locating the object whose reconstructed content position equals baseOffset by re-parsing — simplified workaround:
-				found := false
-				for _, e := range objects {
-					// we don't track pack offsets per-object here; best-effort: if one object's sha equals pack base reference (not available), fail
-					_ = e
-				}
-				if !found {
-					return errors.New("ofs-delta base lookup not implemented in this simplified parser")
+				// ofs-delta: find base object by offset
+				// baseOffset is relative to current position, we need to find the object at that position
+				targetOffset := int64(offset) - baseOffset - int64(consumed)
+				if b, t, ok := findObjectByOffset(objects, targetOffset); ok {
+					base = b
+					baseType = t
+				} else {
+					return fmt.Errorf("ofs-delta base at offset %d not found", targetOffset)
 				}
 			}
 			// apply delta
@@ -809,7 +812,7 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 				return fmt.Errorf("delta apply failed: %w", err)
 			}
 			content = reconstructed
-			finalType = 3 // assume result is blob unless base type tracked; we'll try to infer by reading the content later
+			finalType = baseType // preserve base object type
 		} else {
 			// non-delta: decompressed bytes are the full object payload (header-less).
 			content = decompressed.Bytes()
@@ -838,7 +841,7 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 		if err != nil {
 			return err
 		}
-		objects = append(objects, objEntry{typ: finalType, data: content, sha: shaHex})
+		objects = append(objects, objEntry{typ: finalType, data: content, sha: shaHex, offset: objectStart})
 	}
 	return nil
 }
@@ -851,6 +854,26 @@ func findObjectBySha(objs []objEntry, sha string) ([]byte, bool) {
 		}
 	}
 	return nil, false
+}
+
+// findObjectByShaWithType searches objects slice for matching sha and returns data with type
+func findObjectByShaWithType(objs []objEntry, sha string) ([]byte, int, bool) {
+	for _, o := range objs {
+		if o.sha == sha {
+			return o.data, o.typ, true
+		}
+	}
+	return nil, 0, false
+}
+
+// findObjectByOffset searches objects slice for object at specific pack offset
+func findObjectByOffset(objs []objEntry, offset int64) ([]byte, int, bool) {
+	for _, o := range objs {
+		if o.offset == offset {
+			return o.data, o.typ, true
+		}
+	}
+	return nil, 0, false
 }
 
 // readObjectFromGitDir reads object content (payload after header) from gitDir/.git/objects by hex sha
@@ -1090,8 +1113,20 @@ func checkoutTree(treeSha string, dir string, gitDir string) error {
 			if err != nil {
 				return err
 			}
-			if err := os.WriteFile(full, content, 0644); err != nil {
-				return err
+			// determine file permissions from mode
+			if mode == "120000" {
+				// symlink - create symlink instead of regular file ### CHANGE THIS ###
+				if err := os.Symlink(string(content), full); err != nil {
+					return err
+				}
+			} else {
+				var perm os.FileMode = 0644
+				if mode == "100755" {
+					perm = 0755
+				}
+				if err := os.WriteFile(full, content, perm); err != nil {
+					return err
+				}
 			}
 		}
 	}
