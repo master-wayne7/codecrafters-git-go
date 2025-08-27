@@ -89,7 +89,7 @@ func main() {
 			os.Exit(1)
 		}
 		repoUrl := os.Args[2]
-		dir := os.Args[4]
+		dir := os.Args[3]
 		if err := clone(repoUrl, dir); err != nil {
 			fmt.Fprintf(os.Stderr, "clone failed: %s\n", err)
 			os.Exit(1)
@@ -600,13 +600,14 @@ func fetchPack(base string, wantSha string) ([]byte, error) {
 		if line[0] == '1' || line[0] == '2' || line[0] == '3' {
 			ch := line[0]
 			payload := line[1:]
-			if ch == '1' {
+			switch ch {
+			case '1':
 				// data
 				packBuf.Write(payload)
-			} else if ch == '2' {
+			case '2':
 				// progress
 				fmt.Fprintf(os.Stderr, "%s", &payload)
-			} else if ch == '3' {
+			case '3':
 				// error
 				return nil, fmt.Errorf("remote error: %s", string(payload))
 			}
@@ -685,7 +686,8 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 		// handle delta headers
 		var baseSha string
 		var baseOffset int64
-		if objType == 6 { // ofs-delta
+		switch objType {
+		case 6: // ofs-delta
 			// offset is encoded as variable-length big-endian base offset
 			// see git pack format: a variable-length offset where MSB set indicates continuation
 			// compute base offset backward from current offset
@@ -700,9 +702,7 @@ func parsePackAndWrite(pack []byte, gitDir string) error {
 				baseOffset |= int64(c & 0x7f)
 				n++
 			}
-			// base object is located at (current absolute offset - baseOffset)
-			baseOffset = int64(offset) - baseOffset
-		} else if objType == 7 { // ref-delta
+		case 7: // ref-delta
 			// next 20 bytes are base object's sha1
 			if offset+20 > len(pack) {
 				return errors.New("pack truncated in ref-delta")
