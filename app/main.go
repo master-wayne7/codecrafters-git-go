@@ -482,13 +482,22 @@ func clone(repoUrl string, dir string) error {
 // fetchInfoRefs GET /info/refs?service=git-upload-pack and returns map ref->sha (hex)
 func fetchInfoRefs(base string) (map[string]string, error) {
 	u := strings.TrimSuffix(base, "/") + "/info/refs?service=git-upload-pack"
-	resp, err := http.Get(u)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(u)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	r := bufio.NewReader(resp.Body)
 
+	if resp.StatusCode != http.StatusOK {
+		// return a short body snippet to help debugging
+		snippet := make([]byte, 512)
+		n, _ := resp.Body.Read(snippet)
+		return nil, fmt.Errorf("info/refs returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet[:n])))
+	}
+
+	r := bufio.NewReader(resp.Body)
 	refs := map[string]string{}
 	for {
 		line, err := readPktLine(r)
@@ -505,8 +514,7 @@ func fetchInfoRefs(base string) (map[string]string, error) {
 			if len(p) == 0 {
 				continue
 			}
-
-			// first line may contain capabilitiees after NUL
+			// first line may contain capabilities after NUL
 			// format: <sha> <ref>\0<capabilities>
 			nul := bytes.IndexByte(p, 0)
 			if nul != -1 {
@@ -569,18 +577,26 @@ func writePkt(w io.Writer, s string) {
 func fetchPack(base string, wantSha string) ([]byte, error) {
 	u := strings.TrimSuffix(base, "/") + "/git-upload-pack"
 	reqbody := buildUploadPackRequest(wantSha)
+
+	client := &http.Client{Timeout: 60 * time.Second}
 	req, err := http.NewRequest("POST", u, bytes.NewReader(reqbody))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
 	req.Header.Set("Accept", "application/x-git-upload-pack-result")
-	client := &http.Client{}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		snippet := make([]byte, 512)
+		n, _ := resp.Body.Read(snippet)
+		return nil, fmt.Errorf("git-upload-pack returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet[:n])))
+	}
 
 	reader := bufio.NewReader(resp.Body)
 	var packBuf bytes.Buffer
@@ -605,8 +621,8 @@ func fetchPack(base string, wantSha string) ([]byte, error) {
 				// data
 				packBuf.Write(payload)
 			case '2':
-				// progress
-				fmt.Fprintf(os.Stderr, "%s", &payload)
+				// progress: write to stderr
+				fmt.Fprintf(os.Stderr, "%s", payload)
 			case '3':
 				// error
 				return nil, fmt.Errorf("remote error: %s", string(payload))
@@ -636,12 +652,20 @@ func readPktLine(r *bufio.Reader) ([]byte, error) {
 		}
 		return nil, err
 	}
+
+	// validate header contains hex digits
+	for _, b := range hdr {
+		if !((b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')) {
+			return nil, fmt.Errorf("invalid pkt-line header %q", string(hdr))
+		}
+	}
+
 	l, err := strconv.ParseInt(string(hdr), 16, 0)
 	if err != nil {
 		return nil, err
 	}
 	if l == 0 {
-		return nil, nil //flush packet
+		return nil, nil // flush packet
 	}
 	payloadLen := int(l) - 4
 	payload := make([]byte, payloadLen)
