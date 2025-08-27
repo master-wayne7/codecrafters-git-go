@@ -483,21 +483,41 @@ func clone(repoUrl string, dir string) error {
 func fetchInfoRefs(base string) (map[string]string, error) {
 	u := strings.TrimSuffix(base, "/") + "/info/refs?service=git-upload-pack"
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(u)
+	client := &http.Client{Timeout: 12 * time.Second}
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	// important headers for git smart-http
+	req.Header.Set("Accept", "application/x-git-upload-pack-advertisement")
+	req.Header.Set("User-Agent", "git/1.0")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// return a short body snippet to help debugging
 		snippet := make([]byte, 512)
 		n, _ := resp.Body.Read(snippet)
 		return nil, fmt.Errorf("info/refs returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet[:n])))
 	}
 
-	r := bufio.NewReader(resp.Body)
+	// peek first bytes for easier debugging if server returns HTML
+	br := bufio.NewReader(resp.Body)
+	peek, _ := br.Peek(8)
+	if len(peek) > 0 {
+		// if it looks like "<!DOCTYPE" or "<html", fail fast with helpful message
+		s := strings.ToLower(string(peek))
+		if strings.Contains(s, "<!doctype") || strings.Contains(s, "<html") || strings.HasPrefix(s, "<!") {
+			snip := make([]byte, 1024)
+			n, _ := br.Read(snip)
+			return nil, fmt.Errorf("unexpected HTML response from server: %s", strings.TrimSpace(string(snip[:n])))
+		}
+	}
+
+	r := bufio.NewReader(br)
 	refs := map[string]string{}
 	for {
 		line, err := readPktLine(r)
@@ -507,15 +527,11 @@ func fetchInfoRefs(base string) (map[string]string, error) {
 		if line == nil { // flush
 			break
 		}
-
-		// each packet line may contain multiple refs separated by \n
 		parts := bytes.Split(line, []byte{'\n'})
 		for _, p := range parts {
 			if len(p) == 0 {
 				continue
 			}
-			// first line may contain capabilities after NUL
-			// format: <sha> <ref>\0<capabilities>
 			nul := bytes.IndexByte(p, 0)
 			if nul != -1 {
 				head := p[:nul]
